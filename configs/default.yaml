@@ -1,0 +1,69 @@
+# CrashSafe: Distributed LLM Inference System
+# Default Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  log_level: "info"
+
+router:
+  strategy: "round_robin"          # round_robin | least_loaded | random
+  health_check_interval_s: 5.0
+  request_timeout_s: 60.0
+  max_queue_depth: 100
+
+worker:
+  num_workers: 2
+  worker_host: "127.0.0.1"
+  worker_base_port: 8100
+  startup_timeout_s: 30.0
+
+backend:
+  type: "mock"                     # mock | transformers | vllm
+  model_name: "gpt2"               # used for transformers/vllm backend
+  max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9
+  device: "cpu"                    # cpu | cuda | mps
+
+mock_backend:
+  tokens_per_second: 50.0          # simulated generation speed
+  base_latency_ms: 10.0            # base processing latency
+  token_vocab_size: 50257
+
+recovery:
+  strategy: "token_commit_resume"  # fail_stop | retry_from_scratch | token_commit_resume
+  max_retries: 3
+  retry_backoff_base_s: 0.5
+  retry_backoff_max_s: 10.0
+  checkpoint_every_n_tokens: 10   # flush checkpoint every N tokens
+
+storage:
+  backend: "disk"                  # disk | memory
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  log_dir: "./logs"
+
+metrics:
+  enabled: true
+  log_file: "./logs/metrics.jsonl"
+  flush_interval_s: 1.0
+
+fault_injection:
+  enabled: false
+  default_fault_type: "none"       # none | kill | delay | hang | graceful_shutdown
+  delay_ms: 500
+  hang_duration_s: 30.0
+
+experiment:
+  concurrency_levels: [1, 4, 8]
+  prompt_lengths:
+    short: 32
+    medium: 128
+    long: 512
+  fault_types: ["none", "kill", "delay", "hang"]
+  recovery_strategies: ["fail_stop", "retry_from_scratch", "token_commit_resume"]
+  requests_per_cell: 20
+  output_dir: "./results"
+  figures_dir: "./figures"

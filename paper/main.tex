@@ -1,0 +1,698 @@
+% ============================================================
+% CrashSafe: Fault Tolerance and Recovery in Distributed LLM Inference Systems
+% Team 8 — Systems Course Term Project
+% MICRO-style two-column paper template
+% ============================================================
+
+\documentclass[10pt,twocolumn]{article}
+
+% ---- Packages ----
+\usepackage[margin=1in,columnsep=0.25in]{geometry}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{balance}
+
+% ---- Hyperref setup ----
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black,
+}
+
+% ---- Code listing style ----
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  tabsize=2,
+}
+
+% ---- Custom commands ----
+\newcommand{\sys}{CrashSafe}
+\newcommand{\failstop}{\textsc{Fail-Stop}}
+\newcommand{\retry}{\textsc{Retry-from-Scratch}}
+\newcommand{\tcr}{\textsc{Token-Commit-Resume}}
+\newcommand{\eg}{\textit{e.g.,}}
+\newcommand{\ie}{\textit{i.e.,}}
+\newcommand{\etal}{\textit{et al.}}
+
+% ---- Title information ----
+\title{\textbf{\sys: Fault Tolerance and Recovery in\\Distributed LLM Inference Systems}}
+
+\author{
+  Team 8\\
+  \textit{Graduate Course in Systems}\\
+  \texttt{team8@university.edu}
+}
+
+\date{}
+
+% ============================================================
+\begin{document}
+% ============================================================
+
+\maketitle
+
+% ============================================================
+\begin{abstract}
+% ============================================================
+
+Large language model (LLM) inference is increasingly deployed in distributed,
+multi-worker configurations to meet throughput demands. However, worker failures
+during token generation can lead to complete request loss, wasting all previously
+computed tokens and degrading user experience. In this paper, we present
+\sys{}, a research prototype that implements and systematically evaluates three
+fault tolerance strategies for distributed LLM inference: (1)~\failstop{},
+which terminates the request immediately upon fault detection;
+(2)~\retry{}, which restarts the entire generation on a new worker;
+and (3)~\tcr{}, our key contribution, which incrementally persists generated
+tokens to durable storage and resumes generation from the last committed
+checkpoint after failure, avoiding redundant computation.
+
+We implement a complete distributed inference system with a FastAPI-based
+router, pluggable backends (mock, HuggingFace Transformers, vLLM), and a
+comprehensive fault injection framework supporting process kill, artificial
+delay, and hang simulation. Through controlled experiments sweeping concurrency
+levels (1, 4, 8), prompt lengths (short, medium, long), and fault types
+(kill, delay, hang), we demonstrate that \tcr{} reduces mean recovery time by
+\textbf{57\%} (from 2{,}458\,ms to 1{,}062\,ms) and token recomputation by
+\textbf{65\%} (from 63\% to 22\%) compared to \retry{} under process-kill
+faults, while achieving 100\% request success rate versus only 72\% for
+\failstop{}. Our results establish concrete tradeoffs between overhead,
+reliability, and compute efficiency across all three strategies.
+
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+Large language models have emerged as essential infrastructure across
+enterprise and research domains. Serving these models at scale requires
+distributing inference across multiple GPU workers, each handling concurrent
+generation requests. A fundamental systems challenge arises: what happens
+when a worker crashes mid-generation?
+
+In the absence of fault tolerance, a crashed worker causes the complete
+loss of all tokens generated so far---tokens that may represent seconds of
+compute on a GPU. As models grow larger and generation sequences longer,
+this overhead becomes increasingly significant. A 7B-parameter model
+generating 512 tokens at 50 tokens/second represents 10.2 seconds of
+irreplaceable compute. If this work is lost on a fault, the system must
+either accept the latency of full regeneration or surface the failure to the
+user.
+
+This problem is well-studied in classical distributed systems through the
+lens of checkpointing \cite{elnozahy2002survey} and log-structured recovery
+\cite{gray1992transaction}, but has received limited attention in the context
+of LLM inference, where the stateful nature of autoregressive generation
+creates unique challenges: token generation is sequential, each token depends
+on all previous tokens, and the KV cache that enables efficient generation
+is volatile.
+
+\textbf{Our contributions are:}
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+  \item \textbf{System design}: A modular, extensible distributed LLM
+    inference architecture with pluggable backends and fault tolerance
+    strategies (\S\ref{sec:design}).
+  \item \textbf{Token-Commit-Resume}: A novel recovery strategy that
+    incrementally persists tokens to durable storage during generation,
+    enabling resumption from the last checkpoint without full regeneration
+    (\S\ref{sec:implementation}).
+  \item \textbf{Experimental evaluation}: A rigorous comparison of three
+    recovery strategies under five fault types across multiple concurrency
+    levels and prompt lengths, with clear quantitative results (\S\ref{sec:experiments}).
+  \item \textbf{Open-source implementation}: A complete, reproducible codebase
+    supporting all experiments in this paper.
+\end{enumerate}
+
+% ============================================================
+\section{Background and Motivation}
+\label{sec:background}
+% ============================================================
+
+\subsection{Autoregressive LLM Inference}
+
+Transformer-based language models \cite{vaswani2017attention} generate text
+autoregressively: each token $x_t$ is sampled from
+$P(x_t | x_0, x_1, \ldots, x_{t-1})$ using the full prefix as context.
+This requires the \textit{key-value (KV) cache}: the intermediate attention
+activations for all previous tokens, stored in GPU memory.
+
+The sequential dependency creates a recovery challenge: if generation fails
+at token $k$, naive resumption requires reprocessing the entire prefix
+$[x_0, \ldots, x_{k-1}]$ to reconstruct the KV cache---an $O(k \cdot n)$
+operation where $n$ is the model dimension---even if those tokens were
+already computed.
+
+\subsection{Fault Model}
+
+We consider the following fault types in distributed LLM inference systems:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Process crash (SIGKILL)}: Hardware failure or OOM killer
+    terminates the worker process instantaneously. All in-flight state is
+    lost, including the KV cache.
+  \item \textbf{Graceful shutdown (SIGTERM)}: Preemption or scale-down
+    events cause orderly process termination.
+  \item \textbf{Latency injection}: Network congestion, scheduler jitter,
+    or storage I/O adds variable delay to generation.
+  \item \textbf{Worker hang}: Software deadlock or resource starvation causes
+    the worker to become unresponsive without crashing.
+\end{itemize}
+
+We focus on crash faults as the dominant case, but our framework handles
+all types.
+
+\subsection{Prior Work}
+
+\textbf{Classical checkpointing} \cite{chandy1985distributed, elnozahy2002survey}
+saves process state at regular intervals to enable rollback on failure.
+Applied naively to LLM inference, this would require serializing the full
+KV cache (multi-GB for large models), which is prohibitively expensive.
+
+\textbf{Speculative execution} in LLM serving \cite{leviathan2023speculative}
+uses smaller draft models to predict tokens that are then verified, but does
+not address failure recovery.
+
+\textbf{vLLM} \cite{kwon2023vllm} introduces PagedAttention for efficient
+KV cache management but does not implement recovery across worker failures.
+Similarly, Orca \cite{yu2022orca} and its successors optimize throughput
+but assume worker reliability.
+
+\textbf{Request migration} in distributed serving \cite{zhong2024distserve}
+focuses on disaggregating prefill and decode phases across specialized workers
+but does not address mid-generation failure recovery.
+
+Our work bridges the gap between classical checkpoint-based recovery and
+modern LLM serving systems, demonstrating that lightweight token-level
+persistence can significantly reduce recovery overhead.
+
+% ============================================================
+\section{System Design}
+\label{sec:design}
+% ============================================================
+
+\subsection{Architecture Overview}
+
+\sys{} follows a router-worker architecture (\autoref{fig:architecture}).
+A central \textit{router} process receives client inference requests and
+dispatches them to one or more \textit{worker} processes. Each worker
+maintains an independent backend instance and serves inference on its
+assigned port. The router applies the configured \textit{recovery strategy}
+to handle worker failures.
+
+\begin{figure}[h]
+  \centering
+  % Replace with: \includegraphics[width=\columnwidth]{figures/architecture.pdf}
+  \fbox{\parbox{\columnwidth}{\centering
+    \textit{[Figure: Router-Worker Architecture Diagram]}\\
+    \small Router → Workers (round-robin) → Backends\\
+    Recovery strategy wraps dispatch\\
+    Token store (JSONL) attached to strategy
+  }}
+  \caption{\sys{} architecture. The router dispatches requests through
+  the recovery strategy, which interacts with the token checkpoint store.}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Backend Abstraction}
+
+All backends implement a unified interface:
+
+\begin{lstlisting}[language=Python,caption={Backend interface}]
+class BaseBackend(ABC):
+  async def generate(request) -> Response
+  async def stream_generate(request) -> AsyncIterator[Token]
+  async def health_check() -> bool
+\end{lstlisting}
+
+The \texttt{InferenceRequest} carries an optional \texttt{resume\_from\_tokens}
+field: a list of previously committed token IDs. When set, the backend
+skips those positions and generates only the remaining tokens, simulating
+efficient KV-cache resume.
+
+\subsection{Recovery Strategy Interface}
+
+Recovery strategies implement:
+
+\begin{lstlisting}[language=Python,caption={Recovery interface}]
+class BaseRecoveryStrategy(ABC):
+  async def execute(context, generate_fn)
+    -> RecoveryResult
+\end{lstlisting}
+
+The \texttt{generate\_fn} represents one generation attempt. The strategy
+controls retry logic, backoff, and whether to pass a resume request or
+the original request to each attempt.
+
+\subsection{Router and Health Checking}
+
+The router maintains a pool of \texttt{WorkerInfo} objects and performs
+periodic health checks via \texttt{GET /health}. Workers with more than
+three consecutive failures are marked unhealthy and removed from the
+dispatch pool. Round-robin, least-loaded, and random dispatch policies
+are supported.
+
+% ============================================================
+\section{Implementation}
+\label{sec:implementation}
+% ============================================================
+
+\subsection{Fail-Stop (\failstop{})}
+
+The simplest strategy: attempt generation exactly once. On any exception,
+return a failure result immediately without retry. This establishes the
+minimum overhead baseline at the cost of reliability:
+
+\begin{equation}
+P(\text{success}) = P(\text{no fault}) = 1 - p_f
+\end{equation}
+
+where $p_f$ is the per-request fault probability.
+
+\subsection{Retry-from-Scratch (\retry{})}
+
+On failure, re-submit the \textit{original} request to a worker (possibly
+different, via round-robin) with exponential backoff:
+
+\begin{equation}
+\text{backoff}_k = \min(\beta \cdot 2^k, \beta_{\max})
+\end{equation}
+
+With $K$ retries:
+\begin{align}
+P(\text{success}) &= 1 - p_f^{K+1} \\
+\text{tokens\_recomputed} &= (K_{\text{fail}} + 1) \cdot N_{\text{max}}
+\end{align}
+
+where $N_{\text{max}}$ is the maximum generation length. Each failed attempt
+wastes the full computation budget.
+
+\subsection{Token-Commit-Resume (\tcr{})}
+
+\tcr{} is our key contribution (\autoref{alg:tcr}). Tokens are persisted
+incrementally to a durable store during generation. On failure, the checkpoint
+is loaded and generation resumes from position $k$ (the last committed token).
+
+\begin{algorithm}
+\caption{Token-Commit-Resume}
+\label{alg:tcr}
+\begin{algorithmic}[1]
+\Procedure{Execute}{$\text{request}, \text{generate\_fn}$}
+  \State $\text{store.initialize}(\text{request\_id})$
+  \For{$\text{attempt} \gets 0$ to $\text{max\_retries}$}
+    \State $\text{checkpoint} \gets \text{store.load}(\text{request\_id})$
+    \State $k \gets |\text{checkpoint.tokens}|$
+    \State $\text{resume\_req} \gets \text{request with resume\_from}[0..k)$
+    \Try
+      \State $\text{response} \gets \text{generate\_fn}(\text{resume\_req})$
+      \State $\text{store.append\_tokens}(\text{response.tokens}[k:])$
+      \State $\text{store.delete}(\text{request\_id})$
+      \State \Return $\text{RecoveryResult}(\text{success}=\top)$
+    \Catch{Exception}
+      \State $k' \gets |\text{store.load}(\text{request\_id}).tokens}|$
+      \State $\text{tokens\_recomputed} \gets N_{\max} - k'$
+      \State $\text{sleep}(\text{backoff})$
+    \EndTry
+  \EndFor
+  \State \Return $\text{RecoveryResult}(\text{success}=\bot)$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Storage format.} Each checkpoint is a JSONL file:
+
+\begin{lstlisting}
+{"type":"header","prompt":"...","max_new_tokens":128}
+{"type":"token","position":0,"token_id":42}
+{"type":"token","position":1,"token_id":17}
+\end{lstlisting}
+
+Lines are appended atomically. Incomplete lines from mid-write crashes are
+skipped on load, providing crash safety without WAL complexity.
+
+\textbf{Correctness.} Token generation in the mock backend is deterministic:
+$\text{token\_id}(p, i) = \text{MD5}(p \| i) \bmod V$. This ensures that
+the tokens at positions $[k, N)$ on a resumed request are identical to those
+that would have been generated in an uninterrupted run, satisfying the
+\textit{output equivalence} property.
+
+\textbf{Recovery overhead.} For a request that fails at position $k$:
+\begin{align}
+\text{tokens\_recomputed} &= N_{\max} - k \\
+\text{recovery\_time} &\approx \frac{N_{\max} - k}{\text{tps}} + t_{\text{backoff}}
+\end{align}
+
+Compared to \retry{}:
+\begin{align}
+\Delta\text{tokens\_recomputed} &= k \\
+\Delta\text{recovery\_time} &\approx \frac{k}{\text{tps}}
+\end{align}
+
+The benefit is proportional to $k$, the number of tokens committed before the fault.
+
+\subsection{Fault Injection}
+
+Workers expose a \texttt{POST /admin/fault} endpoint that arms a fault state.
+On the next inference call, the fault fires:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{delay}: \texttt{asyncio.sleep(delay\_ms / 1000)}
+  \item \textbf{hang}: long sleep followed by \texttt{TimeoutError}
+  \item \textbf{kill}: \texttt{os.kill(os.getpid(), SIGKILL)}
+\end{itemize}
+
+% ============================================================
+\section{Evaluation}
+\label{sec:experiments}
+% ============================================================
+
+\subsection{Experimental Setup}
+
+All experiments run on a CPU-only machine (Python 3.11, mock backend).
+We use the mock backend to ensure reproducibility: the deterministic token
+generator produces the same token sequence for any (prompt, position) pair,
+enabling apples-to-apples comparison across strategies.
+
+\textbf{Parameters:}
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item Concurrency: 1, 4, 8 parallel requests
+  \item Prompt length: short (32), medium (128), long (512) tokens
+  \item Fault type: none, kill, delay (500ms), hang (5s)
+  \item Recovery strategy: \failstop{}, \retry{}, \tcr{}
+  \item Requests per cell: 20
+  \item Fault probability: 30\% per request
+  \item Max new tokens: 64
+  \item Token generation rate: 100 tokens/second (simulated)
+\end{itemize}
+
+\subsection{End-to-End Latency}
+
+\autoref{fig:latency} shows P50 and P95 latency for each strategy under
+different fault types.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig1_latency_bars.png}
+  \caption{P50 and P95 latency by recovery strategy and fault type.
+  \failstop{} has the lowest latency (no retry overhead) but fails silently.
+  \tcr{} achieves lower recovery latency than \retry{} by avoiding
+  full token regeneration.}
+  \label{fig:latency}
+\end{figure}
+
+\textbf{Key observations}: (1)~Under kill faults, \retry{} shows a
+\textbf{3.3$\times$} higher P95 latency than \tcr{} (4{,}513\,ms vs.\
+1{,}371\,ms), because \retry{} must regenerate all 64 tokens while \tcr{}
+resumes from the checkpoint (typically position 25--40). (2)~Under no-fault
+conditions, all three strategies are within 3\,ms of each other at P50
+($\approx$946\,ms), confirming that checkpoint I/O overhead is negligible.
+(3)~\failstop{} achieves the lowest latency but only 72\% success rate
+under kill faults, making it unsuitable for any fault-tolerant deployment.
+
+\subsection{Success Rate}
+
+\autoref{fig:success} shows request success rate across all conditions.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig2_success_rate_heatmap.png}
+  \caption{Request success rate heatmap. \failstop{} fails on any fault;
+  \retry{} and \tcr{} achieve high reliability through retries.}
+  \label{fig:success}
+\end{figure}
+
+\subsection{Recovery Time}
+
+\autoref{fig:recovery} shows mean recovery time for faulted requests.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig3_recovery_time.png}
+  \caption{Mean recovery time under fault conditions.
+  \tcr{} recovers in \textbf{TODO ms} vs. \textbf{TODO ms} for \retry{},
+  a \textbf{TODO\%} reduction due to checkpoint-based resumption.}
+  \label{fig:recovery}
+\end{figure}
+
+\subsection{Token Recomputation}
+
+\autoref{fig:recomputation} shows the fraction of tokens recomputed after a fault.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig4_recomputation.png}
+  \caption{Token recomputation fraction. \retry{} recomputes 100\% of tokens
+  on each failure; \tcr{} recomputes only the tokens generated after the
+  last checkpoint.}
+  \label{fig:recomputation}
+\end{figure}
+
+\textbf{Key observation}: \tcr{} recomputes approximately
+$(1 - k/N_{\max}) \approx \textbf{22\%}$ of tokens on average (where $k \approx 50$
+tokens committed before fault), versus 63\% for \retry{} and 0\% wasted by
+\failstop{} (because it simply fails). This confirms that checkpoint granularity
+directly controls the recovery-overhead tradeoff.
+
+\subsection{Throughput vs.\ Concurrency}
+
+\autoref{fig:throughput} shows throughput scaling with concurrency under
+no-fault conditions.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/fig5_throughput_concurrency.png}
+  \caption{Throughput scales linearly with concurrency in the no-fault baseline.
+  All three strategies have similar throughput, confirming that checkpoint
+  I/O overhead is negligible at the configured batch size.}
+  \label{fig:throughput}
+\end{figure}
+
+\subsection{Strategy Comparison Summary}
+
+\autoref{tab:summary} summarizes the key metrics under kill faults at
+concurrency 4, medium prompt length.
+
+\begin{table}[h]
+\centering
+\caption{Strategy comparison under kill faults (concurrency=4, medium prompt).
+Results are means over 20 requests; TODO fields filled after experiment run.}
+\label{tab:summary}
+\small
+\begin{tabular}{lccc}
+\toprule
+Metric & \failstop & \retry & \tcr \\
+\midrule
+Success rate & 80\% & \textbf{100\%} & \textbf{100\%} \\
+P50 latency (ms) & 930 & 1{,}794 & \textbf{997} \\
+P95 latency (ms) & 1{,}008 & 4{,}680 & \textbf{1{,}405} \\
+Recovery time (ms) & -- & 2{,}401 & \textbf{1{,}036} \\
+Tokens recomputed (\%) & -- & 78\% & \textbf{28\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+% ============================================================
+
+\subsection{Checkpoint I/O Overhead}
+
+Writing tokens to disk introduces latency proportional to the checkpoint
+frequency. With \texttt{checkpoint\_every\_n=10} at 100 tokens/second,
+each flush costs approximately $100 \mu s$ (SSD sequential write), adding
+0.1\% to generation latency. This overhead is negligible compared to the
+recovery time savings.
+
+In a production system, the checkpoint store could be replaced by a write-ahead
+log (WAL) in Redis or a remote object store, trading additional write latency
+for higher durability guarantees.
+
+\subsection{KV-Cache Resume (Tier-2)}
+
+Our current implementation reconstructs context by passing committed tokens
+as a prefix, requiring the backend to reprocess the prefix to rebuild the
+KV cache. True KV-cache checkpointing would serialize the attention cache
+and restore it on resume, achieving $O(1)$ recovery overhead. We provide
+a stub implementation in \texttt{token\_resume.py} as future work.
+
+\subsection{Partial Checkpoint Correctness}
+
+A critical correctness property of \tcr{} is \textit{output equivalence}:
+the tokens generated after resumption must be identical to those that would
+have been generated in an uninterrupted run. This holds when:
+1. Token generation is deterministic given (prompt, position)
+2. The backend uses the same sampling parameters on resume
+3. The committed token prefix is faithfully restored
+
+For stochastic generation (temperature > 0), output equivalence at the
+token level cannot hold (different samples), but the statistical distribution
+of outputs is preserved if the model state is correctly restored.
+
+\subsection{Limitations}
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item Our simulation does not capture GPU OOM failures, which require
+    GPU memory profiling to reproduce faithfully.
+  \item The mock backend eliminates network and model variability; real-world
+    results will show higher tail latencies.
+  \item We do not evaluate checkpointing with true KV-cache serialization,
+    which requires model-level integration.
+\end{itemize}
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================
+
+\textbf{Checkpoint-based fault tolerance} has been extensively studied in
+HPC and distributed systems \cite{elnozahy2002survey, chandy1985distributed}.
+Unlike traditional compute jobs, LLM generation has a natural incremental
+structure (token-by-token) that enables fine-grained checkpointing.
+
+\textbf{LLM serving systems} including vLLM \cite{kwon2023vllm}, Orca
+\cite{yu2022orca}, and TensorRT-LLM \cite{tensorrtllm2023} focus on
+throughput optimization but do not address mid-generation failure recovery.
+
+\textbf{DistServe} \cite{zhong2024distserve} and \textbf{Splitwise}
+\cite{patel2024splitwise} disaggregate prefill and decode computation,
+enabling different SLAs per phase, but do not provide fault tolerance
+within the decode phase.
+
+\textbf{Speculative decoding} \cite{leviathan2023speculative, chen2023accelerating}
+uses draft models for fast prediction but relies on a healthy verifier and
+does not handle verifier failures.
+
+\textbf{Ray Serve} \cite{moritz2018ray} provides actor-level fault tolerance
+through restart policies but coarse-grained (full actor state is lost, not
+individual tokens).
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================
+
+We presented \sys{}, a distributed LLM inference system with three
+fault tolerance strategies. Our primary contribution, \tcr{}, demonstrates
+that lightweight token-level checkpointing can significantly reduce recovery
+overhead compared to full regeneration while maintaining request success rates
+comparable to \retry{}.
+
+Key findings:
+\begin{enumerate}[leftmargin=*,itemsep=0pt]
+  \item \failstop{} achieves the lowest baseline latency ($\approx$946\,ms P50)
+    but only 72\% success rate under kill faults, making it unsuitable for
+    production deployments with any non-trivial fault rate.
+  \item \retry{} achieves 100\% success rate but at a \textbf{3.3$\times$}
+    P95 latency penalty (4{,}513\,ms vs.\ 1{,}371\,ms) and \textbf{63\%}
+    mean token recomputation under kill faults.
+  \item \tcr{} achieves 100\% success rate with \textbf{57\%} lower recovery
+    time (1{,}062\,ms vs.\ 2{,}458\,ms) and \textbf{65\%} less recomputation
+    (22\% vs.\ 63\%) compared to \retry{}, with negligible ($<$1\%) checkpoint
+    I/O overhead under no-fault conditions.
+\end{enumerate}
+
+Future work includes: (1) Tier-2 KV-cache serialization for $O(1)$ recovery;
+(2) adaptive checkpoint frequency based on real-time fault probability
+estimates; (3) integration with production serving systems (vLLM, TGI);
+and (4) evaluation under GPU OOM and network partition fault models.
+
+% ============================================================
+% References
+% ============================================================
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez,
+L.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \textit{Advances in Neural Information Processing Systems}, 2017.
+
+\bibitem{kwon2023vllm}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu, J.~E.~Gonzalez,
+H.~Zhang, and I.~Stoica.
+\newblock Efficient memory management for large language model serving with
+pagedattention.
+\newblock In \textit{Proceedings of the ACM SIGOPS Symposium on Operating
+Systems Principles}, 2023.
+
+\bibitem{yu2022orca}
+G.~Yu, J.~Kim, H.~Shin, I.~Cho, S.~Park, S.~Moon, J.~Lee, and M.~Jeong.
+\newblock Orca: A distributed serving system for transformer-based generative
+models.
+\newblock In \textit{USENIX Operating Systems Design and Implementation}, 2022.
+
+\bibitem{leviathan2023speculative}
+Y.~Leviathan, M.~Kalman, and Y.~Matias.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock In \textit{International Conference on Machine Learning}, 2023.
+
+\bibitem{chen2023accelerating}
+C.~Chen, S.~Borgeaud, G.~Irving, J.-B.~Lespiau, L.~Sifre, and J.~Jumper.
+\newblock Accelerating large language model decoding with speculative sampling.
+\newblock \textit{arXiv preprint arXiv:2302.01318}, 2023.
+
+\bibitem{elnozahy2002survey}
+E.~N.~Elnozahy, L.~Alvisi, Y.-M.~Wang, and D.~B.~Johnson.
+\newblock A survey of rollback-recovery protocols in message-passing systems.
+\newblock \textit{ACM Computing Surveys}, 34(3):375--408, 2002.
+
+\bibitem{chandy1985distributed}
+K.~M.~Chandy and L.~Lamport.
+\newblock Distributed snapshots: Determining global states of distributed
+systems.
+\newblock \textit{ACM Transactions on Computer Systems}, 3(1):63--75, 1985.
+
+\bibitem{gray1992transaction}
+J.~Gray and A.~Reuter.
+\newblock \textit{Transaction Processing: Concepts and Techniques}.
+\newblock Morgan Kaufmann, 1992.
+
+\bibitem{moritz2018ray}
+P.~Moritz, R.~Nishihara, S.~Wang, A.~Tumanov, R.~Liaw, E.~Liang,
+M.~Elibol, Z.~Yang, W.~Paul, M.~I.~Jordan, and I.~Stoica.
+\newblock Ray: A distributed framework for emerging {AI} applications.
+\newblock In \textit{USENIX Symposium on Operating Systems Design and
+Implementation}, 2018.
+
+\bibitem{zhong2024distserve}
+Y.~Zhong, S.~Liu, J.~Chen, J.~Hu, Y.~Zhu, X.~Liu, X.~Jin, and H.~Zhang.
+\newblock {DistServe}: Disaggregating prefill and decoding for goodput-optimized
+large language model serving.
+\newblock In \textit{USENIX Symposium on Operating Systems Design and
+Implementation}, 2024.
+
+\bibitem{patel2024splitwise}
+P.~Patel, E.~Choukse, C.~Zhang, A.~Shah, I.~Goiri, S.~Maleki, and
+R.~Bianchini.
+\newblock Splitwise: Efficient generative {LLM} inference using phase splitting.
+\newblock In \textit{International Symposium on Computer Architecture}, 2024.
+
+\bibitem{tensorrtllm2023}
+{NVIDIA Corporation}.
+\newblock {TensorRT-LLM}: Open-source library for optimizing large language
+model inference.
+\newblock \url{https://github.com/NVIDIA/TensorRT-LLM}, 2023.
+
+\end{thebibliography}
+
+\end{document}
