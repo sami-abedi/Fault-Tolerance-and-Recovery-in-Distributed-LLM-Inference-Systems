@@ -154,7 +154,7 @@ CrashSafe/
 ```bash
 # Clone repository
 git clone <repo-url>
-cd CrashSafe
+cd Fault-Tolerance-and-Recovery-in-Distributed-LLM-Inference-Systems
 
 # Create virtual environment
 python -m venv venv
