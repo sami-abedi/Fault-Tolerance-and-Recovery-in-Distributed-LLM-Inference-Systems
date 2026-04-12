@@ -310,4 +310,5 @@ pdflatex main.tex
 ## Team
 
 Team 8 — CrashSafe  
-Course: Fault Tolerance and Recovery in Distributed LLM Inference Systems
+Course: Topics In Distributed Computing 
+Topic :Fault Tolerance and Recovery in Distributed LLM Inference Systems
