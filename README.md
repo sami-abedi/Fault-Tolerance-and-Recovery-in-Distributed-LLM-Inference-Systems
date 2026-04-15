@@ -1,6 +1,6 @@
 # CrashSafe: Fault Tolerance and Recovery in Distributed LLM Inference Systems
 
-**Team 8 — Topics in Distributed Systems (CECS 574)**
+**Team 8 — CrashSafe | Topics in Distributed Systems (CECS 574)**
 
 A research-grade distributed LLM inference system implementing Fail-Stop, Retry-from-Scratch, and Token-Commit-Resume fault tolerance strategies.
 
